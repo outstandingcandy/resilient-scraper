@@ -1,0 +1,59 @@
+FROM python:3.12-slim
+
+# Install Chromium and Xvfb for browser automation.
+# fonts-noto-cjk + fonts-noto-color-emoji make sure Chinese/Japanese/Korean
+# and emoji characters render in screenshots instead of tofu squares —
+# required for readable login/captcha screenshots pushed to Feishu.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    xvfb \
+    fonts-liberation \
+    fonts-noto-cjk \
+    fonts-noto-color-emoji \
+    libnss3 \
+    libxss1 \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libgtk-3-0 \
+    libgbm1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r scraper && useradd -r -g scraper -m scraper
+
+WORKDIR /app
+
+COPY pyproject.toml .
+COPY src/ src/
+
+RUN pip install --no-cache-dir ".[all]" psycopg2-binary
+
+# Create data directories
+RUN mkdir -p /app/data && chown -R scraper:scraper /app
+
+USER scraper
+
+ENV CHROME_BIN=/usr/bin/chromium
+ENV CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage"
+
+# Start Xvfb + Chrome with remote debugging, then run worker.
+# Chrome listens on 127.0.0.1:9222 inside the container.
+# Worker connects to it via use_existing_browser + chrome_debug_port=9222.
+ENTRYPOINT ["sh", "-c", "\
+    Xvfb :99 -screen 0 1920x1080x24 &>/dev/null & \
+    sleep 1 && \
+    DISPLAY=:99 chromium \
+        --no-sandbox \
+        --disable-dev-shm-usage \
+        --disable-gpu \
+        --remote-debugging-port=9222 \
+        --remote-debugging-address=127.0.0.1 \
+        --user-data-dir=/app/data/chrome-profile \
+        --no-first-run \
+        --disable-default-apps \
+        --disable-extensions \
+        --window-size=1920,1080 \
+        about:blank &>/dev/null & \
+    sleep 2 && \
+    exec scraper-worker \
+"]

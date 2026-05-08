@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+.pids/
+data/
+logs/
+infra/cdk.out/
+infra/.venv-cdk/
+infra/cdk.context.json

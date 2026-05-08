@@ -1,0 +1,43 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_URL: ${DB_URL}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-}
+      SCRAPER_LOG_LEVEL: INFO
+    volumes:
+      - ${HOME}/.aws:/home/scraper/.aws:ro
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    environment:
+      DB_URL: ${DB_URL}
+      # Chrome is started inside the container with --remote-debugging-port=9222
+      # Worker connects to it via CDP (use_existing_browser mode)
+      BROWSER_CHROME_DEBUG_PORT: "9222"
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-}
+      # Feishu login verification notifications
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_RECEIVE_ID: ${FEISHU_RECEIVE_ID:-}
+    volumes:
+      # Persist Chrome profile so login cookies survive container restarts
+      - chrome-profile:/app/data/chrome-profile
+      # AWS credentials for S3 access
+      - ${HOME}/.aws:/home/scraper/.aws:ro
+    shm_size: "2gb"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+volumes:
+  chrome-profile:
