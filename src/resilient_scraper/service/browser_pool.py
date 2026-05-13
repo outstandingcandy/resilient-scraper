@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from resilient_scraper.service.config import BrowserPoolSettings
+from resilient_scraper.service.config import BrowserSettings
 
 logger = logging.getLogger("resilient_scraper.service.browser_pool")
 
@@ -35,7 +35,7 @@ class BrowserPool:
     - Auto-recycling after max_tasks_per_browser
     """
 
-    def __init__(self, settings: BrowserPoolSettings) -> None:
+    def __init__(self, settings: BrowserSettings) -> None:
         self._size = settings.size
         self._max_tasks = settings.max_tasks_per_browser
         self._headless = settings.headless
