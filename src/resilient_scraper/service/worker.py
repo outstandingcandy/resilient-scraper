@@ -1,4 +1,10 @@
-"""Worker process: polls task queue, executes scrapers, reports results."""
+"""Worker process: polls task queue, executes scrapers, reports results.
+
+The Worker is persistence-agnostic — it receives an already-constructed
+:class:`resilient_scraper.queue.TaskQueue` implementation from the caller.
+Deciding where tasks live (Postgres, SQLite, in-memory, ...) is the calling
+application's responsibility.
+"""
 
 import asyncio
 import functools
@@ -11,10 +17,9 @@ from typing import Any
 
 from resilient_scraper.errors import NoDataFoundError, ScraperError
 from resilient_scraper.models import ScraperTask, TaskStatus
+from resilient_scraper.queue import TaskQueue
 from resilient_scraper.service.config import ServiceSettings
-from resilient_scraper.service.database import Database
 from resilient_scraper.service.feishu import FeishuClient
-from resilient_scraper.service.queue import TaskQueue
 from resilient_scraper.service.registry import ScraperRegistry
 
 logger = logging.getLogger("resilient_scraper.service.worker")
@@ -23,19 +28,23 @@ logger = logging.getLogger("resilient_scraper.service.worker")
 class Worker:
     """Scraper worker process.
 
-    Polls PostgreSQL for pending tasks, executes them with the appropriate
-    scraper, and reports results back. Manages a browser pool and sends
-    periodic heartbeats.
+    Polls a caller-supplied TaskQueue for pending tasks, executes them with
+    the appropriate scraper, and reports results back. Manages a browser pool
+    and sends periodic heartbeats.
     """
 
-    def __init__(self, settings: ServiceSettings, registry: ScraperRegistry) -> None:
+    def __init__(
+        self,
+        settings: ServiceSettings,
+        registry: ScraperRegistry,
+        queue: TaskQueue,
+    ) -> None:
         self._settings = settings
         self._registry = registry
+        self._queue = queue
         self._worker_id = settings.worker.get_worker_id()
         self._shutdown = asyncio.Event()
         self._current_task_id: int | None = None
-        self._db: Database | None = None
-        self._queue: TaskQueue | None = None
         self._browser_pool: BrowserPool | None = None
         self._xvfb_process: subprocess.Popen | None = None
         self._scrapers: dict[str, Any] = {}
@@ -63,12 +72,12 @@ class Worker:
             await self._teardown()
 
     async def _setup(self) -> None:
-        """Initialize database, queue, browser, and scrapers."""
-        # Database
-        self._db = Database(self._settings.db)
-        await self._db.ensure_tables()
-        self._queue = TaskQueue(self._db)
+        """Initialize browser, Feishu client, and scrapers.
 
+        The queue is injected via the constructor; this method assumes its
+        storage is already set up (the caller is responsible for migrations /
+        schema creation before instantiating the Worker).
+        """
         use_pool = self._settings.browser.pool
 
         if use_pool:
@@ -167,9 +176,7 @@ class Worker:
         if self._xvfb_process:
             self._xvfb_process.terminate()
 
-        # Close database
-        if self._db:
-            await self._db.close()
+        # The queue's lifecycle (engine disposal, etc.) is owned by the caller.
 
         logger.info("Worker %s stopped", self._worker_id)
 
