@@ -1,19 +1,25 @@
-"""PostgreSQL-backed task queue with SELECT FOR UPDATE SKIP LOCKED."""
+"""Reference PostgreSQL implementation of the TaskQueue protocol.
+
+This module is optional. Applications wire their own TaskQueue (satisfying
+:class:`resilient_scraper.queue.TaskQueue`) into ``Worker``; the framework
+itself stays persistence-agnostic. This module is preserved for applications
+that want a ready-to-use PostgreSQL queue.
+"""
 
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa: F401 — re-exported for callers
 
 from resilient_scraper.service.database import Database
 
-logger = logging.getLogger("resilient_scraper.service.queue")
+logger = logging.getLogger("resilient_scraper.service.postgres_queue")
 
 
-class TaskQueue:
-    """Async task queue backed by PostgreSQL."""
+class PostgresTaskQueue:
+    """Async task queue backed by PostgreSQL (reference implementation)."""
 
     def __init__(self, db: Database) -> None:
         self._db = db

@@ -20,7 +20,7 @@ from resilient_scraper.service.api_models import (
 )
 from resilient_scraper.service.config import AutoScaleSettings, ServiceSettings
 from resilient_scraper.service.database import Database
-from resilient_scraper.service.queue import TaskQueue
+from resilient_scraper.service.postgres_queue import PostgresTaskQueue as TaskQueue
 from resilient_scraper.service.registry import ScraperRegistry
 
 logger = logging.getLogger("resilient_scraper.service.api")
