@@ -90,3 +90,55 @@ class ScraperResult(BaseModel):
     error: str | None = None
     duration_seconds: float = 0.0
     retry_scheduled: bool = False
+
+
+class WorkerStatus(str, Enum):
+    """Status of a scraper worker."""
+
+    ACTIVE = "active"
+    IDLE = "idle"
+    BUSY = "busy"
+    STOPPED = "stopped"
+    ERROR = "error"
+
+
+class WorkerInfo(BaseModel):
+    """Information about a scraper worker.
+
+    Attributes:
+        worker_id: Unique worker identifier.
+        status: Current worker status.
+        last_heartbeat: Last heartbeat timestamp.
+        tasks_completed: Total tasks completed by this worker.
+        current_task_id: ID of currently processing task.
+        metadata: Additional worker metadata.
+    """
+
+    worker_id: str
+    status: WorkerStatus = WorkerStatus.IDLE
+    last_heartbeat: datetime = Field(default_factory=utc_now)
+    tasks_completed: int = 0
+    current_task_id: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(use_enum_values=True)
+
+
+class ScraperConfig(BaseModel):
+    """Configuration for a scraper type.
+
+    Attributes:
+        enabled: Whether this scraper is enabled.
+        delay_min: Minimum delay between requests (seconds).
+        delay_max: Maximum delay between requests (seconds).
+        max_retries: Maximum retry attempts per task.
+        timeout: Request timeout (seconds).
+        custom_settings: Scraper-specific settings.
+    """
+
+    enabled: bool = True
+    delay_min: float = 5.0
+    delay_max: float = 15.0
+    max_retries: int = 3
+    timeout: int = 60
+    custom_settings: dict[str, Any] = Field(default_factory=dict)
