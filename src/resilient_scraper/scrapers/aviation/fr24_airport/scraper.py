@@ -49,7 +49,7 @@ class _FR24AirportScraper(ResilientScraper[FR24FlightsResult]):
     default_delay = (10.0, 20.0)
     requires_browser = True
     cloudflare_protected = True
-    task_timeout = 900  # 15 minutes — airport page with heavy pagination
+    task_timeout = 1800  # 30 minutes — arrivals + departures with pagination
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         """Initialize the FR24 flights scraper.
