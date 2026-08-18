@@ -13,7 +13,7 @@ import os
 import signal
 import subprocess
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from resilient_scraper.errors import NoDataFoundError, ScraperError
 from resilient_scraper.models import ScraperTask, TaskStatus
@@ -21,6 +21,11 @@ from resilient_scraper.queue import TaskQueue
 from resilient_scraper.service.config import ServiceSettings
 from resilient_scraper.service.feishu import FeishuClient
 from resilient_scraper.service.registry import ScraperRegistry
+
+if TYPE_CHECKING:
+    # Imported for typing only; `setup()` imports it lazily at runtime so that
+    # merely importing Worker doesn't pull in DrissionPage.
+    from resilient_scraper.service.browser_pool import BrowserPool
 
 logger = logging.getLogger("resilient_scraper.service.worker")
 

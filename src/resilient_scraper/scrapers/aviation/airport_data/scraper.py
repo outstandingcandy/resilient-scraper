@@ -26,7 +26,10 @@ from botocore.exceptions import ClientError
 from resilient_scraper.errors import NoDataFoundError, ScraperError
 from resilient_scraper.models import ScraperTask
 from resilient_scraper.scraper import ResilientScraper
-from resilient_scraper.scrapers.aviation.airport_data.extractor import AirportDataExtractor
+from resilient_scraper.scrapers.aviation.airport_data.extractor import (
+    AirportDataExtractor,
+    aircraft_detail_url,
+)
 from resilient_scraper.scrapers.aviation.airport_data.models import (
     AirportDataAircraftData,
     AirportDataResult,
@@ -60,7 +63,11 @@ class AirportDataScraper(ResilientScraper[AirportDataResult]):
     default_delay: tuple[float, float] = (3.0, 6.0)
     requires_browser: bool = True
 
-    BASE_URL = "https://www.airport-data.com"
+    # No `www.`: the site's certificate lists `airport-data.com` as its only
+    # subject alternative name, so `https://www.airport-data.com/...` fails
+    # verification and a browser lands on its TLS interstitial instead of the
+    # page.
+    BASE_URL = "https://airport-data.com"
 
     # Index letters: 09 for numeric names, then A-Z
     INDEX_LETTERS = ["09"] + [chr(i) for i in range(ord("A"), ord("Z") + 1)]
@@ -441,7 +448,7 @@ class AirportDataScraper(ResilientScraper[AirportDataResult]):
         Returns:
             AirportDataResult with detailed aircraft data.
         """
-        url = f"{self.BASE_URL}/aircraft/{registration}.html"
+        url = aircraft_detail_url(registration)
         logger.info(f"Scraping aircraft detail: {url}")
 
         browser.get(url)
@@ -559,7 +566,7 @@ class AirportDataScraper(ResilientScraper[AirportDataResult]):
                         engines=engines,
                         seats=seats,
                         location=location if location else None,
-                        source_url=f"{self.BASE_URL}/aircraft/{registration}.html",
+                        source_url=aircraft_detail_url(registration),
                     )
                     aircraft_list.append(aircraft)
 

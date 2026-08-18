@@ -13,6 +13,48 @@ from resilient_scraper.extractors.base import BaseExtractor
 
 logger = logging.getLogger("resilient_scraper.scrapers.airport_data.extractor")
 
+# No `www.`: the site's certificate lists `airport-data.com` as its only subject
+# alternative name, so `https://www.airport-data.com/...` fails verification.
+BASE_URL = "https://airport-data.com"
+
+
+def aircraft_detail_url(registration: str) -> str:
+    """Return the canonical detail-page URL for `registration`.
+
+    Extension-less on purpose: the site now redirects the older
+    ``/aircraft/<reg>.html`` form here, and following that redirect costs a
+    round trip on every aircraft we scrape.
+
+    Args:
+        registration: Aircraft registration, e.g. ``"N703PA"``.
+
+    Returns:
+        Absolute URL of the aircraft's detail page.
+    """
+    return f"{BASE_URL}/aircraft/{registration}"
+
+
+def first_record_html(html: str) -> str:
+    """Narrow a detail page to the first aircraft record it contains.
+
+    A registration can be reused, and the site then renders every airframe that
+    ever wore it on one page — N703PA carries both a 1999 Cessna 208B and a 1959
+    Boeing 707. Each record sits in its own ``<div id="aircraftNNN">`` card, and
+    the first one is the current airframe. Extracting from the whole page mixed
+    the two: fields missing from the first record were filled in from the second.
+
+    Args:
+        html: Full HTML of an aircraft detail page.
+
+    Returns:
+        The first record's HTML, or `html` unchanged when the page holds a single
+        record or the card markup isn't recognised.
+    """
+    starts = [m.start() for m in re.finditer(r'<div[^>]*\sid="aircraft\d+"', html)]
+    if len(starts) < 2:
+        return html
+    return html[starts[0] : starts[1]]
+
 
 class AirportDataExtractor(BaseExtractor):
     """Extractor for airport-data.com aircraft detail pages.
@@ -36,8 +78,6 @@ class AirportDataExtractor(BaseExtractor):
     - source_url: URL of the source page
     """
 
-    BASE_URL = "https://www.airport-data.com"
-
     @property
     def version(self) -> str:
         """Extractor version."""
@@ -59,7 +99,7 @@ class AirportDataExtractor(BaseExtractor):
 
         # If no source_url provided, construct it from registration
         if not source_url and registration:
-            source_url = f"{self.BASE_URL}/aircraft/{registration}.html"
+            source_url = aircraft_detail_url(registration)
 
         # Initialize data
         data: dict[str, Any] = {
@@ -82,11 +122,14 @@ class AirportDataExtractor(BaseExtractor):
         if "not found" in html.lower() or "no data" in html.lower():
             return data
 
+        # Scope to the current airframe before parsing; see first_record_html.
+        record_html = first_record_html(html)
+
         # Extract data using table row pattern
-        self._extract_from_table_rows(html, data)
+        self._extract_from_table_rows(record_html, data)
 
         # Try alternative extraction patterns if table parsing missed fields
-        self._extract_from_dl_lists(html, data)
+        self._extract_from_dl_lists(record_html, data)
 
         return data
 
@@ -109,9 +152,12 @@ class AirportDataExtractor(BaseExtractor):
             # Clean value - remove HTML tags and extra whitespace
             value = re.sub(r"<[^>]+>", "", value)
             value = re.sub(r"&nbsp;", " ", value)
-            # Remove "Search all ..." links text
-            value = re.sub(r"\s*Search all\s+\S.*$", "", value, flags=re.IGNORECASE)
             value = re.sub(r"\s+", " ", value).strip()
+            # Drop the trailing "Search all <make> <model>" navigation link that
+            # shares the cell with the value. Collapse whitespace first: the raw
+            # cell spreads the link over several lines, and `.*$` without DOTALL
+            # stops at the first newline, which left the text in place.
+            value = re.sub(r"\s*Search all\s+\S.*$", "", value, flags=re.IGNORECASE).strip()
 
             if not value:
                 continue
@@ -141,13 +187,20 @@ class AirportDataExtractor(BaseExtractor):
     def _map_field(self, label: str, value: str, data: dict[str, Any]) -> None:
         """Map a label/value pair to the appropriate data field.
 
+        Every field is first-write-wins. One detail page can carry several
+        aircraft that shared a registration over time — N703PA lists both a 1999
+        Cessna 208B and a 1959 Boeing 707 — and the first block on the page is
+        the current one. Letting a later block overwrite produced records that
+        mixed the Cessna's identity with the Boeing's year, engine count and
+        seating.
+
         Args:
             label: Field label (lowercase).
             value: Field value.
             data: Dictionary to update with extracted data.
         """
         if "year" in label or "built" in label:
-            if value.isdigit():
+            if value.isdigit() and not data.get("year_built"):
                 year_val = int(value)
                 if 1900 < year_val <= 2100:
                     data["year_built"] = year_val
@@ -162,10 +215,10 @@ class AirportDataExtractor(BaseExtractor):
             if not data.get("serial_number"):
                 data["serial_number"] = value
         elif "engine" in label:
-            if value.isdigit():
+            if value.isdigit() and not data.get("engines"):
                 data["engines"] = int(value)
         elif "seat" in label:
-            if value.isdigit():
+            if value.isdigit() and not data.get("seats"):
                 data["seats"] = int(value)
         elif "owner" in label or "operator" in label:
             if not data.get("owner"):
@@ -301,5 +354,5 @@ class AirportDataExtractor(BaseExtractor):
             "engines": engines,
             "seats": seats,
             "location": location if location else None,
-            "source_url": f"{self.BASE_URL}/aircraft/{registration}.html",
+            "source_url": aircraft_detail_url(registration),
         }
