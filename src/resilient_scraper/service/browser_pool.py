@@ -1,6 +1,7 @@
 """Thread-safe browser pool for DrissionPage Chromium instances."""
 
 import logging
+import os
 import shutil
 import threading
 import time
@@ -145,11 +146,33 @@ class BrowserPool:
             logger.error("Failed to recycle browser %d: %s", instance.id, e)
             instance.healthy = False
 
-    @staticmethod
-    def _find_browser_path() -> str | None:
-        """Find Chromium/Chrome binary path."""
+    # Browsers that never land on $PATH because the platform ships them as
+    # bundles/installers. Checked only after the $PATH lookup, so an explicitly
+    # installed binary still wins.
+    _WELL_KNOWN_BROWSERS = (
+        # macOS
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        # Windows
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    )
+
+    @classmethod
+    def _find_browser_path(cls) -> str | None:
+        """Find the Chromium/Chrome binary, or None to let DrissionPage guess.
+
+        Returning None is not fatal — DrissionPage falls back to its own
+        detection — but it is a coin flip, so resolve the path ourselves
+        wherever we can and hand it over explicitly.
+        """
         for name in ("chromium", "chromium-browser", "google-chrome", "chrome"):
             path = shutil.which(name)
             if path:
                 return path
+        for candidate in cls._WELL_KNOWN_BROWSERS:
+            if os.access(candidate, os.X_OK):
+                return candidate
         return None
