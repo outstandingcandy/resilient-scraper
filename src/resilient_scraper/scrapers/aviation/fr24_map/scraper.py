@@ -16,6 +16,8 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+import requests
+
 from resilient_scraper.errors import PageLoadError, ScraperError
 from resilient_scraper.models import ScraperTask
 from resilient_scraper.scraper import ResilientScraper
@@ -25,6 +27,13 @@ from resilient_scraper.scrapers.aviation.fr24_map.models import (
 )
 
 logger = logging.getLogger("resilient_scraper.scrapers.fr24_map")
+
+# The feed endpoint answers 403 to a request with no User-Agent, so this is
+# required rather than cosmetic.
+_API_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 
 class FR24MapScraper(ResilientScraper[FR24MapResult]):
@@ -36,6 +45,11 @@ class FR24MapScraper(ResilientScraper[FR24MapResult]):
     Configuration options (in scraper config):
         wait_for_load: Seconds to wait for map to fully load (default: 15).
         save_debug_html: Whether to save HTML for debugging (default: False).
+        api_attempts: Tries against the feed API before giving up on it and
+            falling back to the map page (default: 4). See _fetch_from_api
+            for why more than one is needed.
+        api_retry_delay: Seconds between those attempts (default: 1.5).
+        api_timeout: Per-request timeout in seconds (default: 20).
 
     Task payload options:
         lat: Center latitude (required).
@@ -65,6 +79,12 @@ class FR24MapScraper(ResilientScraper[FR24MapResult]):
         super().__init__(config)
         self.wait_for_load = self.config.get("wait_for_load", 15)
         self.save_debug_html = self.config.get("save_debug_html", True)
+        # See _fetch_from_api: the feed endpoint answers with an empty stub
+        # about 60% of the time, so one attempt is not enough to trust a
+        # "no aircraft" answer.
+        self.api_attempts = int(self.config.get("api_attempts", 4))
+        self.api_retry_delay = float(self.config.get("api_retry_delay", 1.5))
+        self.api_timeout = float(self.config.get("api_timeout", 20))
 
     def validate_task(self, task: ScraperTask) -> bool:
         """Validate that the task can be processed.
@@ -155,7 +175,7 @@ class FR24MapScraper(ResilientScraper[FR24MapResult]):
         }
 
         # First, try to get data directly from FR24 API
-        api_aircraft = self._fetch_from_api(browser, task.task_key, bounds)
+        api_aircraft = self._fetch_from_api(task.task_key, bounds)
         if api_aircraft:
             logger.info(f"[{task.task_key}] Found {len(api_aircraft)} aircraft from direct API")
             return FR24MapResult(
@@ -256,23 +276,39 @@ class FR24MapScraper(ResilientScraper[FR24MapResult]):
         )
 
     def _fetch_from_api(
-        self, browser: Any, task_key: str, bounds: dict[str, float]
+        self, task_key: str, bounds: dict[str, float]
     ) -> list[FR24MapAircraftData]:
-        """Fetch aircraft data directly from FR24 API.
+        """Fetch aircraft data directly from FR24's feed API.
 
-        FR24 uses data-cloud.flightradar24.com/zones/fcgi/feed.js API.
+        FR24 uses data-cloud.flightradar24.com/zones/fcgi/feed.js.
+
+        Two things about this endpoint are load-bearing:
+
+        * **A User-Agent is mandatory.** Without one it answers 403.
+        * **It intermittently answers with an empty stub** — HTTP 200 whose
+          body is just ``{"full_count": N, "version": 4}`` and not one
+          aircraft, even for bounds that certainly contain traffic. Measured
+          at roughly 40% good responses, independent of request spacing, so
+          it reads as some edge nodes serving a stale cached payload rather
+          than rate limiting. A single attempt therefore loses the data
+          outright most of the time, which is why this retries.
+
+        Retrying costs `api_attempts` requests for bounds that are genuinely
+        empty (mid-ocean, say). That is the deliberate trade: a wasted
+        request is cheap, and silently reporting "no aircraft" for a busy
+        sector is not.
+
+        This uses a plain HTTP request rather than the browser: the endpoint
+        needs no session or cookies, and driving it through the browser also
+        meant parsing Chrome's JSON-viewer DOM back into JSON.
 
         Args:
-            browser: Browser instance.
             task_key: Task key for logging.
             bounds: Geographic bounds (north, south, east, west).
 
         Returns:
-            List of aircraft data.
+            List of aircraft data. Empty if every attempt came back empty.
         """
-        aircraft: list[FR24MapAircraftData] = []
-
-        # FR24 API URL format
         api_url = (
             f"https://data-cloud.flightradar24.com/zones/fcgi/feed.js?"
             f"bounds={bounds['north']:.2f},{bounds['south']:.2f},"
@@ -280,50 +316,60 @@ class FR24MapScraper(ResilientScraper[FR24MapResult]):
             f"&faa=1&satellite=1&mlat=1&flarm=1&adsb=1&gnd=1&air=1"
             f"&vehicles=0&estimated=1&maxage=14400&gliders=1&stats=0"
         )
+        logger.info(f"[{task_key}] Fetching from API: {api_url}")
 
-        try:
-            logger.info(f"[{task_key}] Fetching from API: {api_url}")
-
-            # Use browser to fetch the API (benefits from same session/cookies)
-            browser.get(api_url)
-            time.sleep(3)
-
-            # Get the JSON response from the page
-            page_text = browser.html
-
-            # Extract JSON from the response
-            # The API might return JSON directly or wrapped in HTML
-            json_text = page_text
-
-            # Try to find JSON in HTML wrapper
-            if "<pre>" in page_text.lower():
-                match = re.search(r"<pre[^>]*>(.*?)</pre>", page_text, re.DOTALL | re.IGNORECASE)
-                if match:
-                    json_text = match.group(1).strip()
-            elif "<body>" in page_text.lower():
-                # Extract text between body tags
-                match = re.search(r"<body[^>]*>(.*?)</body>", page_text, re.DOTALL | re.IGNORECASE)
-                if match:
-                    json_text = re.sub(r"<[^>]+>", "", match.group(1)).strip()
-
-            # Parse JSON
+        for attempt in range(1, self.api_attempts + 1):
+            if attempt > 1:
+                time.sleep(self.api_retry_delay)
             try:
-                data = json.loads(json_text)
-                aircraft = self._parse_flight_data(data, task_key)
-                logger.info(f"[{task_key}] API returned {len(aircraft)} aircraft")
-            except json.JSONDecodeError as e:
-                logger.debug(f"[{task_key}] Failed to parse API response as JSON: {e}")
-                # Save response for debugging
+                response = requests.get(
+                    api_url,
+                    headers={"User-Agent": _API_USER_AGENT},
+                    timeout=self.api_timeout,
+                )
+            except requests.RequestException as e:
+                logger.debug(f"[{task_key}] API request failed (attempt {attempt}): {e}")
+                continue
+
+            if response.status_code != 200:
+                logger.debug(
+                    f"[{task_key}] API returned HTTP {response.status_code} "
+                    f"(attempt {attempt})"
+                )
+                continue
+
+            try:
+                data = response.json()
+            except ValueError as e:
+                logger.debug(
+                    f"[{task_key}] API response was not JSON (attempt {attempt}): {e}"
+                )
                 if self.save_debug_html:
                     debug_path = f"/tmp/fr24_api_response_{task_key}.txt"
                     with open(debug_path, "w", encoding="utf-8") as f:
-                        f.write(page_text[:10000])  # Save first 10k chars
+                        f.write(response.text[:10000])  # Save first 10k chars
                     logger.debug(f"[{task_key}] Saved API response to {debug_path}")
+                continue
 
-        except Exception as e:
-            logger.debug(f"[{task_key}] API fetch failed: {e}")
+            aircraft = self._parse_flight_data(data, task_key)
+            if aircraft:
+                logger.info(
+                    f"[{task_key}] API returned {len(aircraft)} aircraft "
+                    f"(attempt {attempt})"
+                )
+                return aircraft
 
-        return aircraft
+            logger.debug(
+                f"[{task_key}] API returned an empty payload on attempt "
+                f"{attempt}/{self.api_attempts} (full_count="
+                f"{data.get('full_count') if isinstance(data, dict) else '?'})"
+            )
+
+        logger.info(
+            f"[{task_key}] API returned 0 aircraft after {self.api_attempts} "
+            f"attempts; falling back to the map page"
+        )
+        return []
 
     def _save_debug_files(self, browser: Any, task_key: str, html: str) -> None:
         """Save debug HTML and screenshot.
