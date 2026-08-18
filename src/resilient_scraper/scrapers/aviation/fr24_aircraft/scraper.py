@@ -11,7 +11,7 @@ DB persistence is delegated to the calling application via
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from resilient_scraper.errors import NoDataFoundError, PageLoadError, ScraperError
