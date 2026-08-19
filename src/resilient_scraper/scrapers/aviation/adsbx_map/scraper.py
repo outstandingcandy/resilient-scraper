@@ -13,6 +13,7 @@ DB persistence is delegated to the calling application via
 ``scraper.on_success`` (or the ``persist_*`` callbacks on richer scrapers).
 """
 
+import json
 import logging
 import time
 from datetime import UTC, datetime
@@ -28,18 +29,74 @@ from resilient_scraper.scrapers.aviation.adsbx_map.models import (
 
 logger = logging.getLogger("resilient_scraper.scrapers.adsbx_map")
 
+# Aircraft per `run_js` when reading the buffer back. Even deduplicated and
+# trimmed, one payload for every aircraft in view was large enough to stall the
+# CDP call and disconnect the page on the busiest regions; a bounded batch size
+# keeps the transfer independent of how much traffic the region has. A measured
+# full-fleet pass peaked at 11,998 aircraft in one window, so this is 24 batches
+# rather than the 1 the military-only feed needed.
+_DRAIN_CHUNK = 500
+_DRAIN_TIMEOUT = 60.0
+
+
+# The only fields copied out of tar1090's aircraft objects. Those objects carry
+# far more than we store (renderer state, nav modes, per-source signal stats),
+# and the buffer has to cross the CDP bridge in one JSON payload — see
+# _PROC_HOOK_JS. A field read by _parse_aircraft_dict must be listed here or it
+# will silently arrive as None.
+_FEED_FIELDS = (
+    "hex",
+    "icao",
+    "flight",
+    "r",
+    "registration",
+    "t",
+    "icaotype",
+    "desc",
+    "typeDescription",
+    "lat",
+    "lon",
+    "alt_baro",
+    "alt_geom",
+    "gs",
+    "track",
+    "mag_heading",
+    "true_heading",
+    "baro_rate",
+    "geom_rate",
+    "squawk",
+    "category",
+    "emergency",
+    "dbFlags",
+    "country",
+    "ownOp",
+    "seen_pos",
+    "messages",
+    "rssi",
+)
 
 # Wraps window.processAircraft. That function receives every aircraft record
 # tar1090 decodes from the binCraft/zstd XHR, so hooking it is equivalent to
 # decoding the feed ourselves — and keeps working if ADSBx changes transport.
 # The wait() loop is needed because processAircraft is defined by a late-loading
 # bundle; we retry every 50ms until it's installed.
+#
+# The buffer is a map keyed by hex, not a list of every call. tar1090 invokes
+# processAircraft once per aircraft *per feed poll*, so a 60-second window over
+# busy airspace produced ~17,000 entries for ~4,400 aircraft and a 12 MB
+# `run_js` payload that took 30s and intermittently disconnected the page —
+# which _drain_rows then reported as an empty region. Keeping only the newest
+# entry per aircraft and only the fields we parse makes the payload ~1.4 MB and,
+# more importantly, bounds it by the number of aircraft in view rather than by
+# how long we collect.
 _PROC_HOOK_JS = r"""
 (function () {
     if (window.__adsbxProcHook) { return; }
     window.__adsbxProcHook = true;
-    window.__adsbxRows = [];
+    window.__adsbxRows = {};
+    window.__adsbxSeen = 0;
     window.__adsbxProcInstalled = false;
+    var KEYS = __FEED_FIELDS__;
 
     var install = function () {
         if (typeof window.processAircraft !== 'function') {
@@ -50,11 +107,16 @@ _PROC_HOOK_JS = r"""
         window.processAircraft = function (ac, init, uat) {
             try {
                 if (ac && !Array.isArray(ac) && typeof ac === 'object') {
-                    var copy = {};
-                    for (var k in ac) { copy[k] = ac[k]; }
-                    window.__adsbxRows.push(copy);
-                    if (window.__adsbxRows.length > 100000) {
-                        window.__adsbxRows.shift();
+                    var hex = ac.hex || ac.icao;
+                    if (hex) {
+                        var copy = {};
+                        for (var i = 0; i < KEYS.length; i++) {
+                            var k = KEYS[i];
+                            if (ac[k] !== undefined) { copy[k] = ac[k]; }
+                        }
+                        // Last poll wins, matching _rows_to_aircraft.
+                        window.__adsbxRows[String(hex).toLowerCase()] = copy;
+                        window.__adsbxSeen++;
                     }
                 }
             } catch (_) { /* never let the hook break the page */ }
@@ -64,7 +126,7 @@ _PROC_HOOK_JS = r"""
     };
     install();
 })();
-"""
+""".replace("__FEED_FIELDS__", json.dumps(list(_FEED_FIELDS)))
 
 
 class ADSBxMapScraper(ResilientScraper[ADSBxMapResult]):
@@ -123,14 +185,9 @@ class ADSBxMapScraper(ResilientScraper[ADSBxMapResult]):
         lon = float(payload.get("lon", 0.0))
         zoom = int(payload.get("zoom", 4))
         db_flags = int(payload.get("dbFlags", 1))
-        return (
-            f"https://globe.adsbexchange.com/?dbFlags={db_flags}"
-            f"&lat={lat}&lon={lon}&zoom={zoom}"
-        )
+        return f"https://globe.adsbexchange.com/?dbFlags={db_flags}&lat={lat}&lon={lon}&zoom={zoom}"
 
-    def scrape(
-        self, task: ScraperTask, browser: Any | None = None
-    ) -> ADSBxMapResult:
+    def scrape(self, task: ScraperTask, browser: Any | None = None) -> ADSBxMapResult:
         if browser is None:
             raise ScraperError(
                 "Browser required for ADS-B Exchange map scraper",
@@ -186,9 +243,7 @@ class ADSBxMapScraper(ResilientScraper[ADSBxMapResult]):
         # we need a few poll cycles to catch aircraft that weren't in the
         # first snapshot.
         self._wait_for_hook(browser, task.task_key)
-        logger.info(
-            f"[{task.task_key}] Collecting for {self.collect_duration}s..."
-        )
+        logger.info(f"[{task.task_key}] Collecting for {self.collect_duration}s...")
         time.sleep(self.collect_duration)
 
         raw_rows, feed_ts = self._drain_rows(browser, task.task_key)
@@ -199,7 +254,7 @@ class ADSBxMapScraper(ResilientScraper[ADSBxMapResult]):
             aircraft = [a for a in aircraft if a.mil]
 
         if not aircraft and self.save_debug_html:
-            self._save_debug_files(browser, task.task_key, browser.html)
+            self._save_debug_files(browser, task.task_key)
 
         logger.info(
             f"[{task.task_key}] Extracted {len(aircraft)} aircraft "
@@ -207,11 +262,7 @@ class ADSBxMapScraper(ResilientScraper[ADSBxMapResult]):
             f"military_only={self.military_only}, dbFlags={db_flags})"
         )
 
-        feed_dt = (
-            datetime.fromtimestamp(feed_ts, tz=UTC)
-            if feed_ts is not None
-            else None
-        )
+        feed_dt = datetime.fromtimestamp(feed_ts, tz=UTC) if feed_ts is not None else None
         return ADSBxMapResult(
             success=True,
             task_key=task.task_key,
@@ -239,44 +290,141 @@ class ADSBxMapScraper(ResilientScraper[ADSBxMapResult]):
             else:
                 browser.run_js(_PROC_HOOK_JS)
         except Exception as e:
-            logger.warning(
-                f"[{task_key}] Failed to install processAircraft hook: {e}"
-            )
+            logger.warning(f"[{task_key}] Failed to install processAircraft hook: {e}")
 
-    def _wait_for_hook(
-        self, browser: Any, task_key: str, timeout: float = 30.0
-    ) -> None:
+    def _wait_for_hook(self, browser: Any, task_key: str, timeout: float = 30.0) -> None:
+        """Block until the injected hook reports itself installed.
+
+        Args:
+            browser: The browser whose page should have run ``_PROC_HOOK_JS``.
+            task_key: Region name, for logging.
+            timeout: Seconds to wait for the late-loading tar1090 bundle.
+
+        Raises:
+            ScraperError: Retryable, when the hook never installs. Continuing
+                anyway drains an empty buffer and returns ``success=True`` with
+                zero aircraft, which the task source records as "this region has
+                no traffic" — so the region is never retried and the failure
+                appears nowhere. Observed on roughly one page load in five.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                ok = browser.run_js(
-                    "return window.__adsbxProcInstalled === true;"
-                )
+                ok = browser.run_js("return window.__adsbxProcInstalled === true;")
             except Exception:
                 ok = False
             if ok:
                 return
             time.sleep(1)
-        logger.warning(
-            f"[{task_key}] processAircraft hook never reported installed"
+        if self.save_debug_html:
+            # The page as it was when the hook gave up is the only evidence of
+            # why — a Cloudflare interstitial and a slow bundle look identical
+            # from here.
+            self._save_debug_files(browser, task_key)
+        raise ScraperError(
+            f"processAircraft hook never installed within {timeout:.0f}s",
+            task_key=task_key,
+            retryable=True,
         )
 
-    def _drain_rows(
-        self, browser: Any, task_key: str
-    ) -> tuple[list[dict[str, Any]], float | None]:
-        """Pull accumulated rows and the feed's epoch timestamp off the page."""
+    def _drain_rows(self, browser: Any, task_key: str) -> tuple[list[dict[str, Any]], float | None]:
+        """Pull the buffered aircraft and the feed's epoch timestamp off the page.
+
+        Args:
+            browser: The browser whose page holds the hook's buffer.
+            task_key: Region name, for logging.
+
+        Returns:
+            The buffered rows (one per aircraft) and the feed clock, or None when
+            the page does not expose it.
+
+        Raises:
+            ScraperError: Retryable, when the buffer cannot be read. An empty
+                list here is indistinguishable from a region with no traffic, so
+                a failed transfer must not be reported as one — the region would
+                be recorded as empty and not retried.
+        """
         try:
-            rows = browser.run_js("return window.__adsbxRows || [];") or []
+            # The count, not the keys: the slicing happens in the page, so the
+            # key list itself never needs to cross the bridge — and at full-fleet
+            # volume it is the single largest array we would ask CDP to serialise.
+            total = browser.run_js("return Object.keys(window.__adsbxRows || {}).length;") or 0
+            total = int(total)
+            rows: list[dict[str, Any]] = []
+            for start in range(0, total, _DRAIN_CHUNK):
+                # Slice in the page and transfer a bounded number of rows at a
+                # time. Key order is insertion order and the hook only ever
+                # appends new aircraft, so indices stay valid while we read;
+                # aircraft that arrive mid-drain are simply left for next time.
+                #
+                # Stringified in the page and decoded here rather than returned as
+                # an array of objects: CDP's returnByValue is best-effort, and on a
+                # 500-object array it intermittently answers with an objectId
+                # instead, which DrissionPage cannot parse ("js result parsing
+                # error ... 'description': 'Array(500)'"). That killed one region
+                # out of six on a full-fleet pass. A string is always returned by
+                # value, whatever its size.
+                batch = browser.run_js(
+                    "return JSON.stringify(Object.keys(window.__adsbxRows || {})"
+                    f".slice({start}, {start + _DRAIN_CHUNK})"
+                    ".map(function (k) { return window.__adsbxRows[k]; }));",
+                    timeout=_DRAIN_TIMEOUT,
+                )
+                rows.extend(self._decode_batch(batch))
         except Exception as e:
-            logger.warning(f"[{task_key}] Failed to read __adsbxRows: {e}")
-            rows = []
+            raise ScraperError(
+                # The class name matters: DrissionPage's parsing error carries an
+                # empty message, so "{e}" alone logs a bare colon.
+                f"Failed to read the aircraft buffer off the page: {type(e).__name__}: {e}",
+                task_key=task_key,
+                retryable=True,
+            ) from e
         try:
-            feed_ts = browser.run_js(
-                "return typeof now !== 'undefined' ? now : null;"
+            seen = browser.run_js("return window.__adsbxSeen || 0;")
+            logger.info(
+                f"[{task_key}] Drained {len(rows)}/{total} aircraft from {seen} feed "
+                f"updates in {1 + total // _DRAIN_CHUNK} batches"
             )
+        except Exception:  # noqa: S110 - a diagnostic counter, not worth failing on
+            pass
+        try:
+            feed_ts = browser.run_js("return typeof now !== 'undefined' ? now : null;")
         except Exception:
             feed_ts = None
         return rows, (float(feed_ts) if isinstance(feed_ts, (int, float)) else None)
+
+    @staticmethod
+    def _decode_batch(batch: Any) -> list[dict[str, Any]]:
+        """Decode one drained batch, whichever form the bridge returned it in.
+
+        The page stringifies each batch, but a browser build that serialises the
+        array by value anyway would return it as a list — accept both rather than
+        depend on which side of that behaviour we get.
+
+        Args:
+            batch: The raw ``run_js`` return value: a JSON string, an already
+                decoded list, or ``None`` when the page had nothing to give.
+
+        Returns:
+            The batch's aircraft dicts, empty if it was blank or malformed.
+
+        Raises:
+            ScraperError: When the batch is a string that is not valid JSON. A
+                truncated transfer would otherwise silently drop 500 aircraft.
+        """
+        if not batch:
+            return []
+        if isinstance(batch, list):
+            return [r for r in batch if isinstance(r, dict)]
+        if isinstance(batch, str):
+            try:
+                decoded = json.loads(batch)
+            except json.JSONDecodeError as e:
+                raise ScraperError(f"Drained batch was not valid JSON: {e}", retryable=True) from e
+            if isinstance(decoded, list):
+                return [r for r in decoded if isinstance(r, dict)]
+        logger.warning(f"Ignoring drained batch of unexpected type {type(batch).__name__}")
+        return []
 
     # ------------------------------------------------------------------
     # Parsing
@@ -297,11 +445,7 @@ class ADSBxMapScraper(ResilientScraper[ADSBxMapResult]):
             # final entry per hex reflects the most recent known state.
             latest[str(hex_id).lower()] = row
 
-        return [
-            ac
-            for row in latest.values()
-            if (ac := self._parse_aircraft_dict(row, feed_now))
-        ]
+        return [ac for row in latest.values() if (ac := self._parse_aircraft_dict(row, feed_now))]
 
     def _parse_aircraft_dict(
         self, item: Any, now_epoch: float | None
@@ -344,25 +488,17 @@ class ADSBxMapScraper(ResilientScraper[ADSBxMapResult]):
             return ADSBxMapAircraftData(
                 hex=str(hex_id).lower(),
                 flight=flight if isinstance(flight, str) else None,
-                registration=(
-                    registration if isinstance(registration, str) else None
-                ),
+                registration=(registration if isinstance(registration, str) else None),
                 aircraft_type=_as_str(item.get("t") or item.get("icaotype")),
-                type_description=_as_str(
-                    item.get("desc") or item.get("typeDescription")
-                ),
+                type_description=_as_str(item.get("desc") or item.get("typeDescription")),
                 latitude=_as_float(item.get("lat")),
                 longitude=_as_float(item.get("lon")),
                 altitude_baro=alt_baro,
                 altitude_geom=_as_int(item.get("alt_geom")),
                 ground_speed=_as_float(item.get("gs")),
                 track=_as_float(item.get("track")),
-                heading=_as_float(
-                    item.get("mag_heading") or item.get("true_heading")
-                ),
-                vertical_rate=_as_int(
-                    item.get("baro_rate") or item.get("geom_rate")
-                ),
+                heading=_as_float(item.get("mag_heading") or item.get("true_heading")),
+                vertical_rate=_as_int(item.get("baro_rate") or item.get("geom_rate")),
                 squawk=_as_str(item.get("squawk")),
                 category=_as_str(item.get("category")),
                 emergency=_as_str(item.get("emergency")),
@@ -381,11 +517,18 @@ class ADSBxMapScraper(ResilientScraper[ADSBxMapResult]):
 
     # ------------------------------------------------------------------
 
-    def _save_debug_files(self, browser: Any, task_key: str, html: str) -> None:
+    def _save_debug_files(self, browser: Any, task_key: str) -> None:
+        """Persist the page for diagnosis, reading it inside the guard.
+
+        The HTML is fetched here rather than passed in: an empty buffer and a
+        dead page look the same from outside, and reading `browser.html` at the
+        call site made this diagnostic raise on exactly the runs it exists to
+        explain.
+        """
         try:
             debug_path = f"/tmp/adsbx_map_debug_{task_key}.html"
             with open(debug_path, "w", encoding="utf-8") as f:
-                f.write(html)
+                f.write(browser.html)
             logger.info(f"[{task_key}] Saved debug HTML to {debug_path}")
             try:
                 screenshot_path = f"/tmp/adsbx_map_screenshot_{task_key}.png"
