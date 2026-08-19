@@ -4,7 +4,7 @@ JetPhotos scraper implementation.
 Downloads aircraft photos from JetPhotos.com with support for:
 - High-resolution image downloads
 - Cloudflare bypass handling
-- S3 upload integration
+- Object-storage upload (S3, or any store reachable via ``upload_callback``)
 - Duplicate detection
 
 DB persistence (mark aircraft as having images, record metadata rows) is
@@ -20,9 +20,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-import boto3
 import requests
-from botocore.exceptions import ClientError
 
 from resilient_scraper.errors import (
     CloudflareBlockedError,
@@ -46,11 +44,14 @@ class JetPhotosScraper(ResilientScraper[JetPhotosResult]):
 
     Configuration options (in scraper config):
         max_images_per_aircraft: Maximum images to download per aircraft (default: 3)
-        s3_upload: Whether to upload images to S3 (default: False)
+        upload_callback: Object-storage writer supplied by the application; see
+            ``ResilientScraper.__init__``. Takes precedence over s3_upload.
+        s3_upload: Whether to upload images via the built-in boto3 client
+            (default: False)
         s3_bucket: S3 bucket name (required if s3_upload is True)
-        s3_prefix: S3 key prefix (default: "data/jetphotos_images")
+        s3_prefix: Object key prefix (default: "data/jetphotos_images")
         images_dir: Local directory for images (default: "data/jetphotos_images")
-        delete_local_after_upload: Delete local files after S3 upload (default: False)
+        delete_local_after_upload: Delete local files after upload (default: False)
 
     Task payload options:
         max_images: Override max_images_per_aircraft for this task
@@ -93,9 +94,14 @@ class JetPhotosScraper(ResilientScraper[JetPhotosResult]):
         # ``${VAR}`` placeholder (common in local dev).
         if "${" in self.s3_bucket or not self.s3_bucket.strip():
             if self.s3_enabled:
+                destination = (
+                    "Uploads go through the injected callback instead."
+                    if self.config.get("upload_callback") is not None
+                    else "Images will only be saved locally."
+                )
                 logger.info(
                     "S3 upload auto-disabled — bucket is empty or unresolved "
-                    f"({self.s3_bucket!r}). Images will only be saved locally."
+                    f"({self.s3_bucket!r}). {destination}"
                 )
             self.s3_enabled = False
             self.s3_bucket = ""
@@ -491,7 +497,7 @@ class JetPhotosScraper(ResilientScraper[JetPhotosResult]):
 
             # Upload HTML to S3 for debugging/re-extraction
             if metadata and metadata.get("jetphotos_id"):
-                html_s3_path = self._upload_html_to_s3(html, metadata["jetphotos_id"])
+                html_s3_path = self._store_page_html(html, metadata["jetphotos_id"])
                 if html_s3_path:
                     metadata["html_s3_path"] = html_s3_path
 
@@ -500,33 +506,31 @@ class JetPhotosScraper(ResilientScraper[JetPhotosResult]):
             logger.warning(f"Error collecting metadata from {photo_url}: {e}")
             return None
 
-    def _upload_html_to_s3(self, html: str, jetphotos_id: str) -> str | None:
-        """Upload original HTML to S3 for debugging and future re-extraction.
+    def _store_page_html(self, html: str, jetphotos_id: str) -> str | None:
+        """Store the photo page's HTML for debugging and future re-extraction.
+
+        The stored page is what lets the extractor gain a field and be re-run
+        offline instead of re-scraping JetPhotos, so it is worth having on every
+        deployment target — hence ``_store_object`` rather than boto3.
 
         Args:
             html: HTML content of the photo page.
             jetphotos_id: JetPhotos photo ID.
 
         Returns:
-            S3 key if successful, None otherwise.
+            The object key if stored, None otherwise.
         """
-        if not self.s3_client or not self.s3_bucket or not jetphotos_id:
+        if not jetphotos_id or not self.uploads_possible:
             return None
 
-        s3_key = f"{self.s3_prefix}/html/{jetphotos_id}.html"
-        try:
-            self.s3_client.put_object(
-                Bucket=self.s3_bucket,
-                Key=s3_key,
-                Body=html.encode("utf-8"),
-                ContentType="text/html; charset=utf-8",
-                CacheControl="public, max-age=2592000",  # 30 days
-            )
-            logger.debug(f"Uploaded HTML to S3: s3://{self.s3_bucket}/{s3_key}")
-            return s3_key
-        except ClientError as e:
-            logger.warning(f"Failed to upload HTML to S3: {e}")
-            return None
+        key = f"{self.s3_prefix}/html/{jetphotos_id}.html"
+        stored = self._store_object(
+            key,
+            html.encode("utf-8"),
+            content_type="text/html; charset=utf-8",
+            cache_control="public, max-age=2592000",  # 30 days
+        )
+        return key if stored else None
 
     def _download_from_photo_page(
         self,
@@ -582,7 +586,7 @@ class JetPhotosScraper(ResilientScraper[JetPhotosResult]):
 
         # Upload HTML to S3 for debugging/re-extraction
         if photo_id:
-            html_s3_path = self._upload_html_to_s3(html, photo_id)
+            html_s3_path = self._store_page_html(html, photo_id)
             if html_s3_path:
                 metadata["html_s3_path"] = html_s3_path
 
@@ -739,67 +743,55 @@ class JetPhotosScraper(ResilientScraper[JetPhotosResult]):
         return False
 
     def _handle_upload(self, local_path: str) -> str:
-        """Handle S3 upload if enabled.
+        """Store a downloaded image if storage is configured.
 
         Args:
             local_path: Local file path.
 
         Returns:
-            S3 key if uploaded, relative path otherwise.
+            The object key either way — the key is derived from the filename, so
+            an image that was not uploaded still records where it belongs and
+            can be backfilled later.
         """
-        if self.s3_enabled and self.s3_client and self.s3_bucket:
-            s3_key = self._upload_to_s3(local_path)
-            if s3_key:
-                return s3_key
+        if self.uploads_possible:
+            key = self._store_image(local_path)
+            if key:
+                return key
 
         return self._get_relative_path(local_path)
 
-    def _upload_to_s3(self, local_path: str) -> str | None:
-        """Upload a file to S3.
+    def _store_image(self, local_path: str) -> str | None:
+        """Store one downloaded image under the configured prefix.
+
+        Overrides the base class's version because image keys are flat —
+        ``<prefix>/<filename>`` — rather than relative to ``screenshots_dir``.
+        ``web_app.get_image_url()`` and ``src/media/thumbnails`` both derive
+        URLs from that shape, so it must not change.
 
         Args:
             local_path: Local file path.
 
         Returns:
-            S3 key if successful, None otherwise.
+            The object key if stored, None otherwise.
         """
-        if not self.s3_client or not os.path.exists(local_path):
+        filename = os.path.basename(local_path)
+        key = f"{self.s3_prefix}/{filename}" if self.s3_prefix else filename
+
+        if not self._store_file(
+            local_path,
+            key,
+            content_type=self._content_type_of(local_path),
+            cache_control="public, max-age=86400",
+        ):
             return None
 
-        try:
-            filename = os.path.basename(local_path)
-            s3_key = f"{self.s3_prefix}/{filename}" if self.s3_prefix else filename
+        if self.delete_local_after_upload:
+            try:
+                os.remove(local_path)
+            except OSError as e:
+                logger.warning(f"Failed to delete local file: {e}")
 
-            content_type = "image/jpeg"
-            if local_path.lower().endswith(".png"):
-                content_type = "image/png"
-            elif local_path.lower().endswith(".gif"):
-                content_type = "image/gif"
-
-            self.s3_client.upload_file(
-                local_path,
-                self.s3_bucket,
-                s3_key,
-                ExtraArgs={
-                    "ContentType": content_type,
-                    "CacheControl": "public, max-age=86400",
-                },
-            )
-
-            logger.info(f"Uploaded to S3: s3://{self.s3_bucket}/{s3_key}")
-
-            # Delete local file if configured
-            if self.delete_local_after_upload:
-                try:
-                    os.remove(local_path)
-                except OSError as e:
-                    logger.warning(f"Failed to delete local file: {e}")
-
-            return s3_key
-
-        except ClientError as e:
-            logger.error(f"S3 upload failed: {e}")
-            return None
+        return key
 
     def _get_relative_path(self, local_path: str) -> str:
         """Convert local path to relative path for database storage.

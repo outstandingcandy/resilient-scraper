@@ -9,7 +9,9 @@ Provides a complete abstract base class for scraping pages protected by:
 - Infinite scroll pagination (multi-strategy loading)
 - Browser disconnection (reconnection support)
 
-Also includes S3 upload, debug file saving, and configurable delays.
+Also includes object-storage upload (S3 by default, or any store the calling
+application supplies via ``upload_callback``), debug file saving, and
+configurable delays.
 """
 
 import json as _json
@@ -20,6 +22,7 @@ import re
 import smtplib
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from datetime import datetime
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
@@ -84,11 +87,17 @@ class ResilientScraper(ABC, Generic[T]):
                     screenshots_dir: Debug screenshot directory.
                     local_mode: Skip email notifications.
 
-                S3 Upload:
-                    s3_upload: Enable S3 upload (default: False).
+                Object Storage:
+                    upload_callback: Callable ``fn(key, data, content_type,
+                        cache_control) -> bool`` that writes bytes to the
+                        calling application's object storage. When set it
+                        replaces the built-in boto3 client entirely, so a
+                        non-AWS deployment can store scraped files without this
+                        package growing a dependency on its cloud SDK.
+                    s3_upload: Enable the built-in S3 upload (default: False).
                     s3_bucket: S3 bucket name.
-                    s3_prefix: S3 key prefix.
-                    delete_local_after_upload: Delete local files after S3 upload.
+                    s3_prefix: Key prefix, used for both upload paths.
+                    delete_local_after_upload: Delete local files after upload.
 
                 Database:
                     database_url: SQLAlchemy database URL.
@@ -130,6 +139,12 @@ class ResilientScraper(ABC, Generic[T]):
             "delete_local_after_upload", False
         )
         self.s3_client: Any | None = None
+
+        # Injected object-storage writer. Takes precedence over s3_client so a
+        # deployment on another cloud keeps the same keys without boto3.
+        self._upload_callback: Callable[[str, bytes, str | None, str | None], bool] | None = (
+            self.config.get("upload_callback")
+        )
 
         # Database
         self.database_url = self.config.get("database_url", "")
@@ -223,8 +238,11 @@ class ResilientScraper(ABC, Generic[T]):
         self._setup_complete = True
         os.makedirs(self.screenshots_dir, exist_ok=True)
 
-        # Initialize S3 client if enabled
-        if self.s3_enabled and self.s3_bucket:
+        # Initialize S3 client if enabled. An injected upload callback owns the
+        # storage exit, so there is nothing for a boto3 client to do.
+        if self._upload_callback is not None:
+            logger.info(f"[{self.task_type}] Uploads go through the injected callback")
+        elif self.s3_enabled and self.s3_bucket:
             try:
                 import boto3
                 self.s3_client = boto3.client("s3")
@@ -1318,83 +1336,181 @@ class ResilientScraper(ABC, Generic[T]):
         return False
 
     # ===================================================================
-    # S3 upload
+    # Object storage
     # ===================================================================
 
-    def _upload_to_s3(self, local_path: str) -> str | None:
-        """Upload a file to S3.
+    @property
+    def uploads_possible(self) -> bool:
+        """Whether there is anywhere to upload to.
+
+        Returns:
+            True when an upload callback is injected, or when the built-in S3
+            client is configured and ready.
+        """
+        if self._upload_callback is not None:
+            return True
+        return bool(self.s3_enabled and self.s3_client and self.s3_bucket)
+
+    def _store_object(
+        self,
+        key: str,
+        data: bytes,
+        content_type: str | None = None,
+        cache_control: str | None = None,
+    ) -> bool:
+        """Write in-memory bytes to object storage.
+
+        Prefers the injected ``upload_callback`` and falls back to the built-in
+        boto3 client, so the same key is produced on every deployment target.
+
+        Args:
+            key: Object key, already prefixed.
+            data: Raw bytes to store.
+            content_type: MIME type to record with the object.
+            cache_control: ``Cache-Control`` header to serve the object with.
+
+        Returns:
+            True if the object was stored.
+        """
+        if self._upload_callback is not None:
+            try:
+                return bool(self._upload_callback(key, data, content_type, cache_control))
+            except Exception as e:
+                # Deliberately broad: the callback belongs to the calling
+                # application, so its exception types are not importable here.
+                # Storing scraped bytes is best-effort — the caller treats a
+                # False return as "no stored copy" and keeps the scrape — so
+                # this must not propagate and fail the task.
+                logger.warning(f"[{self.task_type}] upload_callback failed for {key}: {e}")
+                return False
+
+        if not self.s3_client or not self.s3_bucket:
+            return False
+
+        extra: dict[str, str] = {}
+        if content_type:
+            extra["ContentType"] = content_type
+        if cache_control:
+            extra["CacheControl"] = cache_control
+        try:
+            self.s3_client.put_object(Bucket=self.s3_bucket, Key=key, Body=data, **extra)
+            logger.debug(f"[{self.task_type}] Stored s3://{self.s3_bucket}/{key}")
+            return True
+        except Exception as e:
+            logger.warning(f"[{self.task_type}] Failed to store {key}: {e}")
+            return False
+
+    def _store_file(
+        self,
+        local_path: str,
+        key: str,
+        content_type: str | None = None,
+        cache_control: str | None = None,
+    ) -> bool:
+        """Write a file on disk to object storage.
+
+        The boto3 fallback streams the file rather than reading it into memory,
+        which is why this exists alongside :meth:`_store_object`.
+
+        Args:
+            local_path: Path of the file to upload.
+            key: Object key, already prefixed.
+            content_type: MIME type to record with the object.
+            cache_control: ``Cache-Control`` header to serve the object with.
+
+        Returns:
+            True if the file was stored.
+        """
+        if not os.path.exists(local_path):
+            return False
+
+        if self._upload_callback is not None:
+            try:
+                with open(local_path, "rb") as handle:
+                    data = handle.read()
+            except OSError as e:
+                logger.warning(f"[{self.task_type}] Cannot read {local_path}: {e}")
+                return False
+            return self._store_object(key, data, content_type, cache_control)
+
+        if not self.s3_client or not self.s3_bucket:
+            return False
+
+        extra: dict[str, str] = {}
+        if content_type:
+            extra["ContentType"] = content_type
+        if cache_control:
+            extra["CacheControl"] = cache_control
+        try:
+            self.s3_client.upload_file(local_path, self.s3_bucket, key, ExtraArgs=extra)
+            logger.info(f"[{self.task_type}] Uploaded to s3://{self.s3_bucket}/{key}")
+            return True
+        except Exception as e:
+            logger.error(f"[{self.task_type}] Upload failed for {key}: {e}")
+            return False
+
+    def _upload_stored_file(self, local_path: str) -> str | None:
+        """Store a downloaded file under its object key.
 
         Args:
             local_path: Local file path.
 
         Returns:
-            Full S3 URL if successful, None otherwise.
+            The object key if stored, None otherwise.
         """
-        if not self.s3_client or not os.path.exists(local_path):
+        key = self._get_relative_path(local_path)
+        if not self._store_file(
+            local_path,
+            key,
+            content_type=self._content_type_of(local_path),
+            cache_control="public, max-age=86400",
+        ):
             return None
 
-        try:
-            from botocore.exceptions import ClientError
-
-            # Preserve subdirectory structure relative to screenshots_dir
+        if self.delete_local_after_upload:
             try:
-                rel_path = os.path.relpath(local_path, self.screenshots_dir)
-            except ValueError:
-                rel_path = os.path.basename(local_path)
-            s3_key = f"{self.s3_prefix}/{rel_path}" if self.s3_prefix else rel_path
-            s3_key = os.path.normpath(s3_key).replace("\\", "/")
+                os.remove(local_path)
+            except OSError as e:
+                logger.warning(f"Failed to delete local file: {e}")
 
-            # Determine content type from extension
-            content_type = "application/octet-stream"
-            ext = local_path.lower().rsplit(".", 1)[-1] if "." in local_path else ""
-            content_type_map = {
-                "jpg": "image/jpeg",
-                "jpeg": "image/jpeg",
-                "png": "image/png",
-                "webp": "image/webp",
-                "gif": "image/gif",
-                "avif": "image/avif",
-                "html": "text/html",
-            }
-            content_type = content_type_map.get(ext, content_type)
+        return key
 
-            self.s3_client.upload_file(
-                local_path,
-                self.s3_bucket,
-                s3_key,
-                ExtraArgs={
-                    "ContentType": content_type,
-                    "CacheControl": "public, max-age=86400",
-                },
-            )
+    @staticmethod
+    def _content_type_of(path: str) -> str:
+        """Guess a MIME type from a filename extension.
 
-            logger.info(f"[{self.task_type}] Uploaded to S3: s3://{self.s3_bucket}/{s3_key}")
+        Args:
+            path: File path or object key.
 
-            if self.delete_local_after_upload:
-                try:
-                    os.remove(local_path)
-                except OSError as e:
-                    logger.warning(f"Failed to delete local file: {e}")
-
-            return s3_key
-
-        except Exception as e:
-            logger.error(f"[{self.task_type}] S3 upload failed: {e}")
-            return None
+        Returns:
+            The matching MIME type, or ``application/octet-stream``.
+        """
+        ext = path.lower().rsplit(".", 1)[-1] if "." in path else ""
+        return {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+            "gif": "image/gif",
+            "avif": "image/avif",
+            "html": "text/html; charset=utf-8",
+            "json": "application/json",
+        }.get(ext, "application/octet-stream")
 
     def _handle_upload(self, local_path: str) -> str:
-        """Handle S3 upload if enabled, otherwise return relative path.
+        """Upload a file if storage is configured, otherwise keep the path.
 
         Args:
             local_path: Local file path.
 
         Returns:
-            S3 key if uploaded, relative path otherwise.
+            The object key either way — an unuploaded file still records the
+            key it would occupy, so a later backfill can find it.
         """
-        if self.s3_enabled and self.s3_client and self.s3_bucket:
-            s3_key = self._upload_to_s3(local_path)
-            if s3_key:
-                return s3_key
+        if self.uploads_possible:
+            key = self._upload_stored_file(local_path)
+            if key:
+                return key
 
         return self._get_relative_path(local_path)
 
