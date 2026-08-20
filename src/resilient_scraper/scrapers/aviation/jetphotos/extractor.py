@@ -15,6 +15,25 @@ from resilient_scraper.extractors.base import BaseExtractor
 
 logger = logging.getLogger("resilient_scraper.scrapers.jetphotos.extractor")
 
+# JetPhotos names an airport as "<name> - <ICAO>", sometimes with a suffix:
+# "Beijing Capital - ZBAA", "Berlin Schoenefeld - EDDB (Closed)". Anchored at the
+# end (or at that suffix) so a name containing a four-letter word cannot match.
+AIRPORT_NAME_ICAO_RE = re.compile(r" - ([A-Z]{4})(?: \(|$)")
+
+
+def icao_from_airport_name(airport_name: str) -> str | None:
+    """Pull the ICAO code out of a JetPhotos airport name.
+
+    Args:
+        airport_name: Airport link text, e.g. `"Beijing Capital - ZBAA"`.
+
+    Returns:
+        The ICAO code, or None for a name that carries none — museums, private
+        strips and the literal `"Inflight"` are all real values here.
+    """
+    match = AIRPORT_NAME_ICAO_RE.search(airport_name)
+    return match.group(1) if match else None
+
 
 class JetPhotosExtractor(BaseExtractor):
     """Extractor for JetPhotos photo page metadata.
@@ -102,6 +121,13 @@ class JetPhotosExtractor(BaseExtractor):
             loc = metadata["location"]
             if any(x in loc for x in ["contentUrl", "datePublished", '{"@', "\\/"]):
                 metadata["location"] = None
+
+        # The code is part of the location text ("Beijing Capital - ZBAA"), and
+        # JSON-LD -- which usually wins above, so _extract_location never runs --
+        # has no separate field for it. Derive it from whichever branch supplied
+        # the location, or it stays empty for every photo.
+        if not metadata.get("airport_icao") and metadata.get("location"):
+            metadata["airport_icao"] = icao_from_airport_name(metadata["location"])
 
         # Extract notes/remarks
         if not metadata.get("notes"):
@@ -314,8 +340,12 @@ class JetPhotosExtractor(BaseExtractor):
             airport_name = location_match.group(2).strip()
             metadata["location"] = airport_name
             metadata["airport_name"] = airport_name
-            # Extract ICAO if it looks like one
-            if re.match(r"^[A-Z]{4}$", airport_code):
+            # The href is a slug, never a bare code, so the ICAO has to come out
+            # of the link text — which is where the site puts it.
+            icao = icao_from_airport_name(airport_name)
+            if icao:
+                metadata["airport_icao"] = icao
+            elif re.match(r"^[A-Z]{4}$", airport_code):
                 metadata["airport_icao"] = airport_code
         else:
             # Fallback: General airport link pattern
@@ -324,9 +354,12 @@ class JetPhotosExtractor(BaseExtractor):
                 html,
             )
             if airport_match:
-                metadata["airport_icao"] = airport_match.group(1)
-                metadata["airport_name"] = airport_match.group(2).strip()
-                metadata["location"] = metadata["airport_name"]
+                airport_name = airport_match.group(2).strip()
+                metadata["airport_name"] = airport_name
+                metadata["location"] = airport_name
+                metadata["airport_icao"] = (
+                    icao_from_airport_name(airport_name) or airport_match.group(1)
+                )
 
     def _extract_notes(self, html: str, metadata: dict[str, Any]) -> None:
         """Extract photo notes/remarks from HTML.
