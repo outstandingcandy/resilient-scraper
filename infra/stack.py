@@ -53,6 +53,15 @@ class ResilientScraperStack(cdk.Stack):
             or os.environ.get("AUTOSCALE_MAX_INSTANCES", "5")
         )
 
+        # S3 bucket-name prefix the worker IAM role is allowed to touch.
+        # Deployments should pin this to their own bucket family (e.g.
+        # `myapp-`) rather than the default `*` glob, which lets the
+        # role read/write any bucket in the account.
+        s3_bucket_prefix = (
+            self.node.try_get_context("s3_bucket_prefix")
+            or os.environ.get("SCRAPER_S3_BUCKET_PREFIX", "*")
+        )
+
         if not vpc_id:
             raise ValueError("vpc_id is required (via -c vpc_id=... or VPC_ID env)")
         if not db_sg_id:
@@ -137,13 +146,16 @@ class ResilientScraperStack(cdk.Stack):
             )
         )
 
-        # S3 — upload screenshots
+        # S3 — upload screenshots / scraped artifacts.
+        # `s3_bucket_prefix` is a bucket-name prefix (default `*` = any
+        # bucket in the account); tenants pin it to their own family via
+        # SCRAPER_S3_BUCKET_PREFIX or the CDK `s3_bucket_prefix` context.
         role.add_to_policy(
             iam.PolicyStatement(
                 actions=["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
                 resources=[
-                    "arn:aws:s3:::flight-matrix-*",
-                    "arn:aws:s3:::flight-matrix-*/*",
+                    f"arn:aws:s3:::{s3_bucket_prefix}",
+                    f"arn:aws:s3:::{s3_bucket_prefix}/*",
                 ],
             )
         )
